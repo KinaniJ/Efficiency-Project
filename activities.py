@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 from datetime import timedelta, time
 from datetime import datetime, timedelta
+from sqlalchemy import create_engine
+import pyodbc
 
 
 #import data file paths named after departments
@@ -26,6 +28,7 @@ def clean_data(df):
     # Strip whitespace from the whole column first
     df['Actual Time'] = df['Actual Time'].astype(str)
     df["Actual Time"] = df["Actual Time"].str.replace(";", ":", regex=False)
+    df["Actual Time"] = df["Actual Time"].str.replace("o", "0", regex=False)
 
 
     #change datatype to string
@@ -106,34 +109,45 @@ def find_time_taken(df):
     return df
 
 
+from datetime import datetime, time, timedelta
+import pandas as pd
 
-#apply duration adjustment rules
 def duration_adjust(row):
     start = row['Start_Time']
-    stop = row['Stop_Time']
+    stop  = row['Stop_Time']
 
-    if pd.isna(start) or pd.isna(stop):
+    # Accept time or 'HH:MM:SS' strings
+    def to_time(x):
+        if pd.isna(x):
+            return None
+        if isinstance(x, time):
+            return x
+        if isinstance(x, datetime):
+            return x.time()
+        if isinstance(x, str) and x.strip():
+            return datetime.strptime(x.strip(), "%H:%M:%S").time()
+        return None
+
+    start = to_time(start)
+    stop  = to_time(stop)
+
+    if start is None or stop is None:
         return timedelta(0)
 
-    # Rule 1: No deduction if start is 2 PM or later
+    # Quick exits
+    if stop <= time(10, 30):
+        return timedelta(0)
     if start >= time(14, 0):
         return timedelta(0)
-    
-    # Rule 1b: No deduction if start is between 1 PM and 2 PM
-    if time(13, 0) <= start < time(14, 0):
-        return timedelta(0)
 
-    # Rule 1: No deduction if both times are between 11 AM and 1 PM
-    if time(11, 0) <= start <= time(13, 0) and time(11, 0) <= stop <= time(13, 0):
-        return timedelta(0)
-
-    # Apply deductions
     deduction = timedelta(0)
 
-    if stop > time(11, 0):
+    # Tea break: crosses 10:30
+    if start < time(10, 30) and stop > time(10, 30):
         deduction += timedelta(minutes=30)
 
-    if stop > time(14, 0):
+    # Lunch: only if shift works into afternoon
+    if start < time(14, 0) and stop >= time(14, 0):
         deduction += timedelta(hours=1)
 
     return deduction
@@ -163,30 +177,38 @@ def clean_time(df):
 #apply the functions
 production=clean_data(production)
 production=find_time_taken(production)
+
 # Apply adjustment function to each row
 production['Duration_Adjust'] = production.apply(duration_adjust, axis=1)
 production=clean_time(production)
+production['Category']= production['Category'].replace({'Grace':'Warehouse/Store',
+                                                        'Denvis':'Crop Protection',
+                                                        'James':'Technical'})
+production.rename(columns={'Planned activity': 'PlannedActivity',
+                  'Actual Activity': 'ActualActivity'},
+                   inplace=True)
 
-
-
-print(production.info())
-print(production.head())
 
 
 #find number of staff by group
 production['Group'].fillna(method='ffill', inplace=True)
-groups = groups[['HARVEST NO', 'GRP']]
+groups = groups[['NO', 'GRP']]
 groups.drop(
-    columns=[col for col in groups.columns if col not in ['HARVEST NO', 'GRP']],
+    columns=[col for col in groups.columns if col not in ['NO', 'GRP']],
     inplace=True
 )
-Group_size = groups.groupby('GRP')['HARVEST NO'].nunique().reset_index()
-print(Group_size)
+Group_size = groups.groupby('GRP')['NO'].nunique().reset_index()
+
+
 
 #marge df and and group size
 production = pd.merge(production, Group_size, left_on='Group', right_on='GRP', how='left')
-production=production.rename(columns={'HARVEST NO': 'Group_Size'})
-print(production)
+production=production.rename(columns={'NO': 'Group_Size'})
+production=production.drop(columns=['GRP'])
+production['No.Staff'] = production['No.Staff'].fillna(production['Group_Size'])
+#production['No.Staff'] = production['No.Staff'].fillna(0).astype(int)
+production = production.dropna(subset=['ActualActivity'])
+
 
 from datetime import datetime, timedelta
 
@@ -199,7 +221,7 @@ def date_from_week(year, week, day):
 
 
 print(date_from_week(2025, 47, 3))  # week 10, day 3 (Wednesday)
-production['Date'] = production.apply(
+production['Activity_Date'] = production.apply(
     lambda row: date_from_week(int(row['Year']), int(row['Week']), int(row['Day'])),
     axis=1
 )
@@ -208,17 +230,28 @@ print(production.info())
 
 
 #cleaning and Technical and plumbing
-Technical=pd.concat([plumbing, technical, electricals], ignore_index=True, axis =0)
+Technical=pd.concat([plumbing, electricals, technical], ignore_index=True, axis =0)
+Technical.rename(columns={'Planned activity': 'PlannedActivity',
+                  'Actual Activity': 'ActualActivity',
+                  'No.Staff': 'No_Staff',
+                  'Date': 'Activity_Date',
+                  'Activity_Date':'Date'
+                  },
+                  inplace=True)
+
+
 print(Technical.info())
 
 
 #apply the functions
 Technical=clean_data(Technical)
 Technical=find_time_taken(Technical)
+
+
 # Apply adjustment function to each row
 Technical['Duration_Adjust'] = Technical.apply(duration_adjust, axis=1)
 Technical=clean_time(Technical)
-Technical['Date'] = production.apply(
+Technical['Activity_Date'] = Technical.apply(
     lambda row: date_from_week(int(row['Year']), int(row['Week']), int(row['Day'])),
     axis=1
 )
@@ -226,3 +259,28 @@ Technical['Date'] = production.apply(
 
 Technical.to_csv(r"C:\Users\Admin\bkg.nl(1)\OLT-Power BI - Human Resource - Human Resource\Evalyne Lenku's files - actual activities\Clean Data\clean_data_technical & Plumbing.csv", index=False)
 production.to_csv(r"C:\Users\Admin\bkg.nl(1)\OLT-Power BI - Human Resource - Human Resource\Evalyne Lenku's files - actual activities\Clean Data\clean_data Production.csv", index=False)
+
+
+#created date column to know when the data was cleaned
+production["DateCreated"] = datetime.today().date()
+Technical["DateCreated"] = datetime.today().date()
+
+
+#Correct SQLAlchemy connection stringls
+engine = create_engine( 
+    "mssql+pyodbc://Judy.Kinani:Previous09&@10.21.25.25\\SQLEXPRESS/OLTEPESI"
+    "?driver=ODBC+Driver+17+for+SQL+Server")
+
+
+
+
+# # Write to SQL Server - let IDENTITY do its job!
+# production.to_sql("ProductionActivities", con=engine, if_exists="append", index=False, chunksize=1000)
+# # print(f"✅ Appended {len(production)} rows to ProductionActivities")
+
+# Technical.to_sql("TechnicalActivities", con=engine, if_exists="append", 
+#                 index=False, chunksize=1000)
+
+
+
+
